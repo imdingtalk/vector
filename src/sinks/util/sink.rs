@@ -40,6 +40,7 @@ use crate::{buffers::Acker, Event};
 use async_trait::async_trait;
 use futures::{
     compat::{Compat, Future01CompatExt},
+    future::maybe_done,
     stream::BoxStream,
     FutureExt, TryFutureExt,
 };
@@ -236,8 +237,14 @@ where
         if self.linger.is_none() {
             trace!("Starting new batch timer.");
             // We just inserted the first item of a new batch, so set our delay to the longest time
-            // we want to allow that item to linger in the batch before being flushed.
-            let delay = Box::new(delay_for(self.timeout).never_error().boxed().compat());
+            // we want to allow that item to linger in the batch before being flushed. The
+            // `maybe_done` wrapper is important here (see comment in `poll_complete`).
+            let delay = Box::new(
+                maybe_done(delay_for(self.timeout))
+                    .never_error()
+                    .boxed()
+                    .compat(),
+            );
             self.linger = Some(delay);
         }
 
@@ -272,21 +279,32 @@ where
                     let fut = self.service.call(request, batch_size).compat();
                     tokio::spawn(fut);
 
-                    // Disable linger timeout
-                    self.linger.take();
+                    // Remove the now-sent batch's linger timeout
+                    self.linger = None;
                 } else {
-                    // We have a batch but we can't send any items
-                    // most likely because we have not hit either
-                    // our batch size or the timeout. Here we want
-                    // to poll the inner futures but still return
-                    // NotReady if the linger timeout is not complete yet.
+                    // We have data but not a full batch and the linger time has not elapsed, so do
+                    // not sent a request yet. Instead, poll the inner service to drive progress
+                    // and defer readiness to the linger timeout if present.
                     if let Some(linger) = &mut self.linger {
-                        trace!("Polling batch linger.");
                         self.service.poll_complete()?;
+
+                        // It's unlikely that we get past `try_ready` here because there's no way
+                        // for `should_send` to return false without polling a present `linger`. If
+                        // we do get past it, that means the timer expired within the tiny window
+                        // between the two `poll` calls and we should loop again because it's
+                        // probably time to send a batch. That's where it gets tricky. As noted
+                        // above, `should_send` calls `poll` on `linger`. But we just called `poll`
+                        // on `linger` ourselves and it returned `Ready`. Normally, it's a contract
+                        // violation to re-poll a future that has returned `Ready`. But we also
+                        // can't reset `linger`, because then `should_send` would not know that it
+                        // had expired and we might not send a batch when we should. The solution
+                        // is that we wrapped the timer future in `linger` with `maybe_done`, which
+                        // essentially caches the `Ready` value of a future and continues to
+                        // present it as `Ready` upon subsequent `poll` calls. This means we can
+                        // safely poll `linger` again in `should_send` and it will return `Ready`,
+                        // causing us to correctly send a batch.
+                        trace!("Polling batch linger.");
                         try_ready!(linger.poll());
-                        // If the linger is ready, we've done it.
-                        // Reset the state so we don't get UB later.
-                        self.linger.take();
                     } else {
                         try_ready!(self.service.poll_complete());
                     }
